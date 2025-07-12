@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: effihire-chatbot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: DB_NAME
+        value: effihire
+      - key: DB_USER
+        value: admin
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "5432"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PDF_PATH
+        value: "./EffiHire_document.pdf"
