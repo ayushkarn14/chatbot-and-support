@@ -2,15 +2,13 @@ from flask import Flask, request, jsonify, session
 from flask_cors import CORS, cross_origin
 import PyPDF2
 from sentence_transformers import SentenceTransformer
+from elasticsearch import Elasticsearch
 import os
 import google.genai as genai
 from datetime import timedelta
 import psycopg2
 import uuid
 from dotenv import load_dotenv
-import json
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 load_dotenv()
 
@@ -60,8 +58,13 @@ def get_db_connection():
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 PDF_PATH = os.environ.get("PDF_PATH", "./EffiHire_document.pdf")
-EMBEDDINGS_PATH = "./embeddings.json"
+INDEX_NAME = "pdf_index"
 
+es_client = Elasticsearch(
+    ["http://elastic:password@localhost:9200"],  # Use list format
+    verify_certs=False,
+    http_compress=True,
+)
 client = genai.Client(api_key=GEMINI_API_KEY)
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -85,77 +88,65 @@ def pdf_to_documents(pdf_path):
         return []
 
 
-def load_embeddings():
-    """Load embeddings from JSON file."""
-    try:
-        with open(EMBEDDINGS_PATH, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return []
-    except Exception as e:
-        print(f"Error loading embeddings: {e}")
-        return []
-
-
-def save_embeddings(embeddings_data):
-    """Save embeddings to JSON file."""
-    try:
-        with open(EMBEDDINGS_PATH, "w") as f:
-            json.dump(embeddings_data, f, indent=2)
-        print(f"Embeddings saved to {EMBEDDINGS_PATH}")
-    except Exception as e:
-        print(f"Error saving embeddings: {e}")
-
-
-def create_embeddings_from_pdf(pdf_path):
-    """Creates embeddings from PDF and saves to JSON file."""
-    documents = pdf_to_documents(pdf_path)
-    if not documents:
-        print("No documents found in PDF")
-        return False
-
-    embeddings_data = []
-    print(f"Creating embeddings for {len(documents)} documents...")
+def index_documents(es_client, index_name, documents):
+    """Indexes documents in Elasticsearch."""
+    if not es_client.indices.exists(index=index_name):
+        try:
+            es_client.indices.create(
+                index=index_name,
+                body={
+                    "mappings": {
+                        "properties": {
+                            "text": {"type": "text"},
+                            "embedding": {
+                                "type": "dense_vector",
+                                "dims": 384,
+                                "index": True,
+                                "similarity": "cosine",
+                            },
+                        }
+                    }
+                },
+                ignore=400,
+            )
+            print(f"Created index '{index_name}'")
+        except Exception as e:
+            print(f"Error creating index: {e}")
+            return
 
     for i, doc in enumerate(documents):
         try:
             embedding = embedding_model.encode(doc)
-            embeddings_data.append(
-                {"id": i, "text": doc, "embedding": embedding.tolist()}
+            es_client.index(
+                index=index_name,
+                id=i,
+                document={"text": doc, "embedding": embedding.tolist()},
+                refresh="wait_for",
             )
-            print(f"Processed document {i + 1}/{len(documents)}")
         except Exception as e:
-            print(f"Error creating embedding for document {i}: {e}")
-
-    save_embeddings(embeddings_data)
-    return True
+            print(f"Error indexing document {i}: {e}")
 
 
-def search_documents_json(query, top_k=3):
-    """Search for similar documents using JSON embeddings and cosine similarity."""
+def search_documents(es_client, index_name, query, top_k=3):
+    """Searches for similar documents in Elasticsearch using kNN."""
     try:
-        # Load embeddings
-        embeddings_data = load_embeddings()
-        if not embeddings_data:
-            print("No embeddings found")
-            return []
-
-        # Create query embedding
         query_embedding = embedding_model.encode(query)
-
-        # Calculate similarities
-        similarities = []
-        for item in embeddings_data:
-            doc_embedding = np.array(item["embedding"])
-            similarity = cosine_similarity(
-                query_embedding.reshape(1, -1), doc_embedding.reshape(1, -1)
-            )[0][0]
-            similarities.append((similarity, item["text"]))
-
-        # Sort by similarity and return top_k
-        similarities.sort(key=lambda x: x[0], reverse=True)
-        return [text for _, text in similarities[:top_k]]
-
+        search_body = {
+            "knn": {
+                "field": "embedding",
+                "query_vector": query_embedding.tolist(),
+                "k": top_k,
+                "num_candidates": top_k * 10,
+            },
+            "size": top_k,
+            "_source": ["text"],
+        }
+        response = es_client.search(index=index_name, body=search_body)
+        if response and "hits" in response and "hits" in response["hits"]:
+            return [hit["_source"]["text"] for hit in response["hits"]["hits"]]
+        else:
+            print("Warning: No hits found or unexpected response format.")
+            return []
     except Exception as e:
         print(f"Error searching documents: {e}")
         return []
@@ -384,11 +375,6 @@ def save_support_chat_message(ticket_id, sender, message):
         conn.close()
 
 
-@app.route("/home", methods=["GET"])
-def test():
-    return "Hellow Worldie"
-
-
 @app.route("/query", methods=["POST"])
 def query_endpoint():
     """Endpoint to receive a question, consider history, and return an answer."""
@@ -411,7 +397,7 @@ def query_endpoint():
     current_turn = len(history) + 1
 
     # Search Documents (RAG part)
-    context_docs = search_documents_json(query)
+    context_docs = search_documents(es_client, INDEX_NAME, query)
     context = "\n---\n".join(context_docs)
 
     # Generate Answer
@@ -446,6 +432,12 @@ def clear_history_endpoint():
         return jsonify({"message": "Failed to clear history from database."}), 500
 
 
+# Remove the session-related endpoints as they're no longer needed
+# @app.route("/init_session", methods=["GET"])
+# @app.route("/check_session", methods=["GET"])
+# @app.before_request
+
+# Simplify CORS since we don't need credentials anymore
 CORS(
     app,
     resources={
@@ -623,28 +615,22 @@ def init_session():
 
 if __name__ == "__main__":
     try:
-        # Check if embeddings file exists, if not create it
-        if not os.path.exists(EMBEDDINGS_PATH):
-            print(f"Embeddings file not found. Creating embeddings from PDF...")
-            if create_embeddings_from_pdf(PDF_PATH):
-                print("Embeddings created successfully.")
+        if (
+            not es_client.indices.exists(index=INDEX_NAME)
+            or es_client.count(index=INDEX_NAME)["count"] == 0
+        ):
+            print(f"Index '{INDEX_NAME}' not found or empty. Indexing PDF...")
+            documents = pdf_to_documents(PDF_PATH)
+            if documents:
+                index_documents(es_client, INDEX_NAME, documents)
+                print("PDF indexed successfully.")
             else:
-                print("Failed to create embeddings from PDF.")
+                print("Failed to load documents from PDF. Cannot index.")
         else:
-            embeddings_data = load_embeddings()
-            if not embeddings_data:
-                print(
-                    f"Embeddings file exists but is empty. Creating embeddings from PDF..."
-                )
-                if create_embeddings_from_pdf(PDF_PATH):
-                    print("Embeddings created successfully.")
-                else:
-                    print("Failed to create embeddings from PDF.")
-            else:
-                print(f"Loaded {len(embeddings_data)} documents from embeddings file.")
+            print(f"Index '{INDEX_NAME}' already exists and contains documents.")
     except Exception as e:
-        print(f"Error during initial embeddings check/creation: {e}")
+        print(f"Error during initial index check/creation: {e}")
 
     # Use PORT environment variable for Cloud Run
-    port = int(os.environ.get("PORT", 50001))
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
