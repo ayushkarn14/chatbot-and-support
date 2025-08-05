@@ -1,4 +1,4 @@
-# EffiHire RAG Chatbot
+# EffiHire Chatbot
 
 A Retrieval-Augmented Generation (RAG) chatbot for EffiHire that answers questions based on company documentation.
 
